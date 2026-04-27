@@ -1,4 +1,4 @@
-# 🎙️ Brickfolio Audio Intelligence Pipeline
+# 🎙️ Brickfolio Transcription Service
 ### *High-Fidelity Diarized Transcription Engine*
 
 This repository provides a robust, production-grade pipeline for converting raw audio recordings into structured **JSON subtitle data**. It is optimized for high-volume ingestion, multilingual support (Hindi/English), and extreme cost-efficiency using Google's **Gemini 2.5 Flash**.
