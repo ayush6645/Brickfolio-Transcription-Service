@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Environment Variables
+.env
+
+# Data & Artifacts (Keep the folders, ignore the contents)
+Audio_Data/*
+!Audio_Data/.gitkeep
+
+data/
+output/
+logs/*
+!logs/.gitkeep
+metadata/*
+!metadata/.gitkeep
+temp_processing/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Scratch/Local tests
+scratch/
+
+# Agent & Workspace noise
+.gemini/
+.antigravity/
+.antigravityignore
+node_modules/
+dist/
+build/

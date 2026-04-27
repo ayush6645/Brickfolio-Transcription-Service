@@ -1,0 +1,13 @@
+pydub
+librosa
+noisereduce
+google-genai
+requests
+filetype
+torchaudio==2.7.1
+speechbrain==1.1.0
+hyperpyyaml
+julius
+fastapi
+uvicorn
+python-dotenv
