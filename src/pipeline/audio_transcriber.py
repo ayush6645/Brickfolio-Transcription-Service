@@ -1,174 +1,257 @@
 """
-Stage 04: Multimodal Transcription
-
-This stage leverages Gemini 2.5 Pro's native multimodal capabilities to 
-directly 'hear' and transcribe the audio files. 
-
-Benefits of Gemini-Native Transcription:
-1. Native Diarization: Automatically identifies Speaker A and Speaker B.
-2. Contextual Accuracy: Better at identifying real-estate specific terms and 
-   locations within the audio stream.
-3. Roman Script Preservation: Transcribes Hindi/Marathi phonetically into 
-   English letters, making it cost-effective for LLM analysis.
-
-Process:
-1. Upload standardized audio fragment to Gemini File API.
-2. Poll for processing completion.
-3. Execute generation with transcription-specific prompts.
+Stage 04: Provider-backed transcription with validation and fallback.
 """
+
+from __future__ import annotations
 
 import json
 import time
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List
 
-from google import genai
-from google.genai import types
-
-# Ensure internal modules are discoverable
-sys.path.append(str(Path(__file__).parent.parent))
 from ..infrastructure.config import settings as config
 from ..infrastructure.utils.logger import get_logger
-from ..infrastructure.utils.gemini_client import resilient_generate
+from ..infrastructure.utils.pipeline_telemetry import record_ai_validation
+from .providers import DeepgramProvider, GeminiProvider
+from .providers.base import BaseTranscriptionProvider, ProviderResponse
 
-# Stage-specific logger for monitoring transcription quality
 logger = get_logger("audio_transcriber")
 
-def transcribe_with_gemini(input_file_path: Path) -> Any:
-    """
-    Directly uploads audio to Gemini and requests a diarized transcript.
 
-    Args:
-        input_file_path: Path to the standardized/cleaned WAV file.
+class TranscriptValidationError(RuntimeError):
+    """Raised when a provider transcript cannot be normalized into usable turns."""
 
-    Returns:
-        The full Gemini response object.
 
-    Raises:
-        ValueError: If API keys are missing or File API upload fails.
-    """
-    if not config.GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not defined in the workspace environment.")
-        
-    client = genai.Client(api_key=config.GEMINI_API_KEY)
-    
-    logger.info(f"Uploading '{input_file_path.name}' to Gemini File System...")
-    
-    # Upload to Gemini's ephemeral file storage
-    uploaded_file = client.files.upload(path=str(input_file_path))
-    
-    # Multimodal files require a 'PROCESSING' wait period before they can be used in prompts
-    while uploaded_file.state == 'PROCESSING':
-        logger.debug("Gemini is still indexing audio content...")
-        time.sleep(5)
-        uploaded_file = client.files.get(name=uploaded_file.name)
-        
-    if uploaded_file.state == 'FAILED':
-        raise RuntimeError(f"Gemini File Engine failed to process audio: {uploaded_file.error.message}")
-        
-    logger.info(f"Gemini Audio indexing complete. Size: {uploaded_file.size_bytes} bytes.")
+@dataclass(frozen=True)
+class TranscriptionArtifact:
+    transcript_path: Path
+    text_path: Path
+    provider: str
+    model: str
+    turns: List[Dict[str, Any]]
+    validation: Dict[str, Any]
+    fallback_used: bool
+    raw_payload: Dict[str, Any]
+    attempts_used: int
+    latency_ms: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
 
-    # Execute structured transcription
-    # We use a strict system prompt defined in config to ensure Roman script and JSON format.
-    response = resilient_generate(
-        client=client,
-        model=config.AUDIT_TRANSCRIPTION_MODEL,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(text=config.STRUCTURED_TRANSCRIPTION_PROMPT),
-                    types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type)
-                ]
-            )
-        ],
-        config_params=types.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json"
+
+def _provider_registry() -> Dict[str, BaseTranscriptionProvider]:
+    return {
+        "gemini": GeminiProvider(),
+        "deepgram": DeepgramProvider(),
+    }
+
+
+def _provider_sequence() -> List[BaseTranscriptionProvider]:
+    registry = _provider_registry()
+    sequence: List[BaseTranscriptionProvider] = []
+    primary = registry.get(config.PRIMARY_TRANSCRIPTION_PROVIDER)
+    if primary:
+        sequence.append(primary)
+    if config.ENABLE_PROVIDER_FALLBACK:
+        fallback = registry.get(config.FALLBACK_TRANSCRIPTION_PROVIDER)
+        if fallback and fallback.name != getattr(primary, "name", None):
+            sequence.append(fallback)
+    return sequence
+
+
+def normalize_turns(raw_turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, turn in enumerate(raw_turns or []):
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+        start = turn.get("start", turn.get("start_ms", 0) / 1000.0)
+        end = turn.get("end", turn.get("end_ms", 0) / 1000.0)
+        speaker = str(turn.get("speaker") or f"Speaker {index % 2}")
+        normalized.append(
+            {
+                "speaker": speaker,
+                "start": round(float(start), 3),
+                "end": round(float(end), 3),
+                "text": text,
+            }
         )
+    normalized.sort(key=lambda turn: (turn["start"], turn["end"]))
+    return normalized
+
+
+def validate_turns(turns: List[Dict[str, Any]], *, duration_hint_sec: float) -> Dict[str, Any]:
+    issues: List[str] = []
+    empty_segments = 0
+    total_chars = 0
+    previous_start = -1.0
+
+    if not turns:
+        issues.append("no_turns")
+
+    for turn in turns:
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            empty_segments += 1
+            continue
+        total_chars += len(text)
+        start = float(turn.get("start", 0.0))
+        end = float(turn.get("end", 0.0))
+        if start < 0 or end <= start:
+            issues.append("invalid_timestamp_range")
+        if previous_start > start + 0.001:
+            issues.append("non_monotonic_start_times")
+        previous_start = max(previous_start, start)
+
+    if empty_segments:
+        issues.append("empty_segments")
+
+    if turns and duration_hint_sec > 0:
+        if turns[-1]["end"] > duration_hint_sec + max(config.OVERLAP_SEC, 2):
+            issues.append("timestamp_exceeds_chunk_duration")
+
+    if duration_hint_sec >= 30 and total_chars < 10:
+        issues.append("suspiciously_short_transcript")
+
+    deduped_issues = sorted(set(issues))
+    return {
+        "is_valid": not deduped_issues,
+        "issues": deduped_issues,
+        "total_turns": len(turns),
+        "empty_segments_count": empty_segments,
+        "total_chars": total_chars,
+        "duration_hint_sec": round(duration_hint_sec, 3),
+    }
+
+
+def _write_artifacts(
+    *,
+    output_dir: Path,
+    chunk_name: str,
+    response: ProviderResponse,
+    turns: List[Dict[str, Any]],
+    validation: Dict[str, Any],
+    attempts_used: int,
+) -> TranscriptionArtifact:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"{chunk_name}_transcript.json"
+    txt_path = output_dir / f"{chunk_name}_transcript.txt"
+    validation = {**validation, "attempts_used": attempts_used}
+
+    full_text = "\n".join(f"{turn['speaker']}: {turn['text']}" for turn in turns)
+    payload = {
+        "source": f"{response.provider} ({response.model})",
+        "full_text": full_text,
+        "structured_turns": turns,
+        "segment_summary": response.raw_payload.get("segment_summary", ""),
+        "metadata": {
+            "provider": response.provider,
+            "model": response.model,
+            "timestamp": time.time(),
+            "validation": validation,
+        },
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    txt_path.write_text(full_text, encoding="utf-8")
+    return TranscriptionArtifact(
+        transcript_path=json_path,
+        text_path=txt_path,
+        provider=response.provider,
+        model=response.model,
+        turns=turns,
+        validation=validation,
+        fallback_used=response.provider != config.PRIMARY_TRANSCRIPTION_PROVIDER,
+        raw_payload=response.raw_payload,
+        attempts_used=attempts_used,
+        latency_ms=response.latency_ms,
+        tokens_in=response.tokens_in,
+        tokens_out=response.tokens_out,
     )
-    
-    # Optionally delete the file from Gemini to save project quota
-    try:
-        client.files.delete(name=uploaded_file.name)
-    except Exception:
-        pass # Not critical if deletion fails
-        
-    return response
+
+
+def transcribe_chunk(
+    input_file_path: Path,
+    output_dir: Path,
+    *,
+    chunk_name: str,
+    duration_sec: float,
+    file_id: str | None = None,
+) -> TranscriptionArtifact:
+    input_file_path = Path(input_file_path)
+    last_error = "No provider attempted."
+    providers = _provider_sequence()
+    if not providers:
+        raise RuntimeError("No transcription providers are configured.")
+
+    attempts_used = 0
+    for provider in providers:
+        if not provider.is_available():
+            continue
+        for attempt in range(config.MAX_TRANSCRIPTION_VALIDATION_RETRIES):
+            attempts_used += 1
+            try:
+                response = provider.transcribe(
+                    input_file_path,
+                    prompt=config.STRUCTURED_TRANSCRIPTION_PROMPT,
+                    audio_duration_sec=duration_sec,
+                )
+                turns = normalize_turns(response.turns)
+                validation = validate_turns(turns, duration_hint_sec=duration_sec)
+                record_ai_validation(
+                    {
+                        "file_id": file_id,
+                        "chunk_name": chunk_name,
+                        "provider": provider.name,
+                        "model": response.model,
+                        "attempt": attempts_used,
+                        "json_validity": validation["is_valid"],
+                        "issues": validation["issues"],
+                        "total_turns_captured": validation["total_turns"],
+                        "empty_segments_count": validation["empty_segments_count"],
+                    }
+                )
+                if not validation["is_valid"]:
+                    last_error = f"{provider.name} validation failed: {', '.join(validation['issues'])}"
+                    logger.warning(last_error)
+                    continue
+                return _write_artifacts(
+                    output_dir=output_dir,
+                    chunk_name=chunk_name,
+                    response=response,
+                    turns=turns,
+                    validation=validation,
+                    attempts_used=attempts_used,
+                )
+            except Exception as exc:
+                last_error = f"{provider.name} transcription failed: {exc}"
+                logger.warning(last_error)
+                record_ai_validation(
+                    {
+                        "file_id": file_id,
+                        "chunk_name": chunk_name,
+                        "provider": provider.name,
+                        "model": getattr(provider, "name", provider.name),
+                        "attempt": attempts_used,
+                        "json_validity": False,
+                        "issues": ["provider_error"],
+                        "error": str(exc),
+                        "total_turns_captured": 0,
+                        "empty_segments_count": 0,
+                    }
+                )
+                continue
+
+    raise TranscriptValidationError(last_error)
+
 
 def transcribe_full_audio(input_clean_file_path: Path, output_dir: Path) -> Path:
     """
-    Primary orchestrator for the transcription stage.
-    Handles AI communication and local artifact persistence.
-
-    Args:
-        input_clean_file_path: Path to the studio-restored audio.
-        output_dir: Directory to save the transcript artifacts.
-
-    Returns:
-        Path: Path to the generated JSON transcript.
+    Compatibility wrapper for older single-file call sites.
     """
-    input_clean_file_path = Path(input_clean_file_path)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        response = transcribe_with_gemini(input_clean_file_path)
-        
-        # Parse result with robust multi-tier fallback for raw/JSON text
-        raw_text = response.text
-        result_data = {}
-        try:
-            # Tier 1: Strict JSON parsing
-            result_data = json.loads(raw_text)
-        except json.JSONDecodeError:
-            logger.warning("Gemini returned non-standard JSON. Attempting text recovery.")
-            # Fallback: Treat as raw transcript if it's not JSON
-            result_data = {"transcript": raw_text}
-
-        # Standardization: Ensure we have a string field for the full text
-        # 'turns' is the modern structured format, 'transcript' is the legacy/fallback.
-        
-        # If the model returned a list directly, wrap it in a dict
-        if isinstance(result_data, list):
-            result_data = {"turns": result_data}
-            
-        full_text = ""
-        if isinstance(result_data, dict) and "turns" in result_data and isinstance(result_data["turns"], list):
-            for turn in result_data["turns"]:
-                speaker = turn.get("speaker", "Unknown")
-                text = turn.get("text", "")
-                full_text += f"{speaker}: {text}\n"
-        else:
-            # Safely handle dict or string fallback
-            full_text = result_data.get("transcript", result_data.get("text", raw_text)) if isinstance(result_data, dict) else str(result_data)
-        
-        output_json_path = output_dir / f"{input_clean_file_path.stem}_transcript.json"
-        
-        # Prepare the pipeline-compatible intelligence artifact
-        final_output = {
-            "source": f"Gemini Multimodal ({config.AUDIT_TRANSCRIPTION_MODEL})",
-            "full_text": full_text.strip(),
-            "structured_turns": result_data.get("turns", []),
-            "segment_summary": result_data.get("segment_summary", ""),
-            "metadata": {
-                "model": config.AUDIT_TRANSCRIPTION_MODEL,
-                "timestamp": time.time()
-            }
-        }
-        
-        with open(output_json_path, 'w', encoding='utf-8') as f:
-            json.dump(final_output, f, ensure_ascii=False, indent=2)
-            
-        # Export a human-readable text version for quick manual auditing
-        output_txt_path = output_dir / f"{input_clean_file_path.stem}_transcript.txt"
-        with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(full_text.strip())
-            
-        logger.info(f"Transcription Complete: artifacts saved to '{output_dir.name}'.")
-        return output_json_path
-        
-    except Exception as e:
-        logger.error(f"Critical failure in Transcription Stage: {e}")
-        raise
+    artifact = transcribe_chunk(
+        input_clean_file_path,
+        output_dir,
+        chunk_name="chunk_000",
+        duration_sec=0.0,
+    )
+    return artifact.transcript_path

@@ -4,10 +4,8 @@ Local Folder Audio Source Adapter
 Implements the AudioSource interface for reading files from a local directory.
 """
 
-import os
 from pathlib import Path
 from typing import List, Optional
-import filetype
 
 from .base import AudioSource, AudioFileMetadata
 from ..config import settings as config
@@ -29,13 +27,12 @@ class LocalFolderSource(AudioSource):
         discovered = []
         
         # Supported extensions (can be expanded)
-        SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'}
+        SUPPORTED_EXTENSIONS = set(config.SUPPORTED_AUDIO_EXTENSIONS)
         
         logger.info(f"Scanning local directory: {self.folder_path}")
         
         for file in self.folder_path.iterdir():
             if file.is_file() and file.suffix.lower() in SUPPORTED_EXTENSIONS:
-                # Basic validation using filetype if needed, but extension is usually enough for local
                 try:
                     stats = file.stat()
                     discovered.append(AudioFileMetadata(

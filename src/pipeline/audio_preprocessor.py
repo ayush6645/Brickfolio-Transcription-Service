@@ -1,110 +1,137 @@
 """
-Stage 03: Audio Preprocessing (Speech Restoration)
-
-This stage applies Brickfolio's 'Studio-Grade' restorative audio processing 
-to standardized recordings. The goal is to aggressively isolate human speech 
-from background field noise (traffic, wind, call-center static) without 
-introducing digital artifacts.
-
-Features:
-- Adaptive Cleaning: Automatically selects a noise-reduction profile (BYPASS, 
-  SAFE, or STRONG) based on Real-Time Signal-to-Noise Ratio (SNR) analysis.
-- Multi-Pass Restoration: If the aggressive filter causes speech degradation, 
-  the stage automatically falls back to safer profiles.
-- Spectral Re-masking: Reconstructs high-frequency speech components lost 
-  during noise subtraction.
-
-Dependencies:
-- librosa: For spectral and SNR analysis.
-- utils.restoration_engine: Core DSP implementation.
+Adaptive preprocessing for speech restoration.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
 
 import librosa
 
-# Ensure internal modules are discoverable for imports
-sys.path.append(str(Path(__file__).parent.parent))
 from ..infrastructure.config import settings as config
 from ..infrastructure.utils.logger import get_logger
-from ..infrastructure.utils.restoration_engine import restore_speech, analyze_audio_metrics
 
-# Stage-specific logger for monitoring restoration quality
 logger = get_logger("audio_preprocessor")
 
-def preprocess_full_file(input_wav_path: Path, output_dir: Path) -> Path:
-    """
-    Analyzes and restores human speech in a standardized WAV file.
 
-    Args:
-        input_wav_path: Path to the standardized source recording.
-        output_dir: Destination for the 'Studio-Clean' WAV file.
+@dataclass(frozen=True)
+class PreprocessResult:
+    output_path: Path
+    restoration_profile: str
+    snr_db: float | None
+    clipping_rate: float | None
+    speech_ratio: float | None
+    speech_preserved: bool
+    clarity_preserved: bool
+    used_cached_artifact: bool = False
 
-    Returns:
-        Path: The file path to the cleaned audio artifact.
+    def to_dict(self) -> dict:
+        return {
+            "output_path": str(self.output_path),
+            "restoration_profile": self.restoration_profile,
+            "snr_db": self.snr_db,
+            "clipping_rate": self.clipping_rate,
+            "speech_ratio": self.speech_ratio,
+            "speech_preserved": self.speech_preserved,
+            "clarity_preserved": self.clarity_preserved,
+            "used_cached_artifact": self.used_cached_artifact,
+        }
 
-    Raises:
-        RuntimeError: If DSP processing fails or audio metrics cannot be extracted.
-    """
+
+def preprocess_full_file(input_wav_path: Path, output_dir: Path) -> PreprocessResult:
     input_wav_path = Path(input_wav_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     cleaned_output = output_dir / f"{input_wav_path.stem}_cleaned.wav"
-    
-    # 1. Idempotency Check: Don't re-clean if already done. 
-    # This saves significant CPU time in large batches.
+
+    if not config.ENABLE_SPEECH_RESTORATION:
+        logger.info("Speech restoration disabled; standardized audio will be used directly.")
+        return PreprocessResult(
+            output_path=input_wav_path,
+            restoration_profile="disabled",
+            snr_db=None,
+            clipping_rate=None,
+            speech_ratio=None,
+            speech_preserved=True,
+            clarity_preserved=True,
+        )
+
     if cleaned_output.exists():
-        logger.info(f"Skipping preprocessing: Studio-Clean file already exists for '{input_wav_path.name}'.")
-        return cleaned_output
+        logger.info(f"Skipping preprocessing for '{input_wav_path.name}' because a cleaned artifact already exists.")
+        return PreprocessResult(
+            output_path=cleaned_output,
+            restoration_profile="cached",
+            snr_db=None,
+            clipping_rate=None,
+            speech_ratio=None,
+            speech_preserved=True,
+            clarity_preserved=True,
+            used_cached_artifact=True,
+        )
 
-    try:
-        logger.info(f"Analyzing audio profile for Speech Restoration: '{input_wav_path.name}'")
-        
-        if config.ENABLE_ADAPTIVE_CLEANING:
-            # Load file to analyze signal quality
-            raw_audio, sr = librosa.load(str(input_wav_path), sr=config.TARGET_SAMPLE_RATE, mono=True)
-            snr_db, clipping_rate, speech_ratio = analyze_audio_metrics(raw_audio, sr)
-            
-            logger.info(f"Signal Analysis: SNR: {snr_db:.2f}dB | Clipping: {clipping_rate:.4f} | Voice: {speech_ratio:.2f}")
+    logger.info(f"Analyzing audio profile for speech restoration: '{input_wav_path.name}'")
+    from ..infrastructure.utils.restoration_engine import analyze_audio_metrics, restore_speech
 
-            # Profile Selection Logic:
-            # - BYPASS: For already clean studio-grade recordings.
-            # - SAFE: For moderate office/home noise.
-            # - STRONG: For high-noise field calls (Road, Construction, Crowds).
-            if snr_db > config.SNR_BYPASS_THRESHOLD and clipping_rate < config.MAX_CLIPPING_RATE:
-                profile = "BYPASS"
-            elif snr_db >= config.SNR_SAFE_THRESHOLD:
-                profile = "SAFE"
-            else:
-                profile = "STRONG"
-                
-            logger.info(f"Adaptive Profile Selection: {profile}")
-            
-            # First Attempt: Apply selected profile
-            output_file, is_preserved, is_clear = restore_speech(input_wav_path, cleaned_output, profile=profile)
-            
-            # Quality Assurance Fallback Loop
-            # If the filter is too aggressive and cuts into speech (loss of continuity), 
-            # we retry with a gentler profile.
-            if profile == "STRONG" and (not is_preserved or not is_clear):
-                logger.warning(f"Restoration Quality Alert: STRONG profile degraded speech in '{input_wav_path.name}'. Recalibrating to SAFE.")
-                output_file, is_preserved, is_clear = restore_speech(input_wav_path, cleaned_output, profile="SAFE")
+    raw_audio, sr = librosa.load(str(input_wav_path), sr=config.TARGET_SAMPLE_RATE, mono=True)
+    snr_db, clipping_rate, speech_ratio = analyze_audio_metrics(raw_audio, sr)
+    logger.info(
+        "Signal analysis for %s: SNR %.2fdB | clipping %.4f | voice %.2f",
+        input_wav_path.name,
+        snr_db,
+        clipping_rate,
+        speech_ratio,
+    )
 
-            if profile == "SAFE" and (not is_preserved or not is_clear):
-                logger.warning(f"Final Quality Warning: SAFE profile still degrading speech in '{input_wav_path.name}'. Falling back to original signal (BYPASS).")
-                output_file, _, _ = restore_speech(input_wav_path, cleaned_output, profile="BYPASS")
+    if config.ENABLE_ADAPTIVE_CLEANING:
+        if snr_db > config.SNR_BYPASS_THRESHOLD and clipping_rate < config.MAX_CLIPPING_RATE:
+            profile = "BYPASS"
+        elif snr_db >= config.SNR_SAFE_THRESHOLD:
+            profile = "SAFE"
         else:
-            # Forced cleaning if adaptive mode is disabled (useful for extremely noisy sets)
-            logger.info(f"Adaptive mode OFF. Applying STATIC-STRONG profile to '{input_wav_path.name}'.")
-            output_file, _, _ = restore_speech(input_wav_path, cleaned_output, profile="STRONG")
-        
-        logger.info(f"Studio Speech Restoration complete for '{cleaned_output.name}'.")
-        return cleaned_output
-        
-    except Exception as e:
-        logger.error(f"Critical DSP Failure during restoration of {input_wav_path.name}: {e}")
-        raise
+            profile = "STRONG"
+    else:
+        profile = "STRONG"
+
+    logger.info(f"Adaptive profile selection for '{input_wav_path.name}': {profile}")
+    output_path, speech_preserved, clarity_preserved = restore_speech(
+        input_wav_path,
+        cleaned_output,
+        profile=profile,
+    )
+
+    if profile == "STRONG" and (not speech_preserved or not clarity_preserved):
+        logger.warning(
+            "STRONG restoration degraded speech for '%s'; retrying with SAFE profile.",
+            input_wav_path.name,
+        )
+        profile = "SAFE"
+        output_path, speech_preserved, clarity_preserved = restore_speech(
+            input_wav_path,
+            cleaned_output,
+            profile=profile,
+        )
+
+    if profile == "SAFE" and (not speech_preserved or not clarity_preserved):
+        logger.warning(
+            "SAFE restoration still degraded speech for '%s'; falling back to BYPASS.",
+            input_wav_path.name,
+        )
+        profile = "BYPASS"
+        output_path, speech_preserved, clarity_preserved = restore_speech(
+            input_wav_path,
+            cleaned_output,
+            profile=profile,
+        )
+
+    logger.info(f"Speech restoration complete for '{output_path.name}' using profile {profile}.")
+    return PreprocessResult(
+        output_path=output_path,
+        restoration_profile=profile,
+        snr_db=snr_db,
+        clipping_rate=clipping_rate,
+        speech_ratio=speech_ratio,
+        speech_preserved=speech_preserved,
+        clarity_preserved=clarity_preserved,
+    )

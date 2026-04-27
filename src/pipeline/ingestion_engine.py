@@ -1,100 +1,87 @@
 """
-Audio Ingestion Engine
-
-This is the central entry point for the "Audio Database" input.
-It abstracts the source of audio files and orchestrates the initial 
-stages of the pipeline (deduplication, state initialization).
+Audio ingestion engine for batch folder processing.
 """
 
-from pathlib import Path
-from typing import List, Optional, Type
-import sys
+from __future__ import annotations
 
-# Ensure internal modules are discoverable
-from ..infrastructure.config import settings as config
-from ..infrastructure.adapters.base import AudioSource, AudioFileMetadata
+from typing import List, Optional
+
+from ..infrastructure.adapters.base import AudioFileMetadata, AudioSource
 from ..infrastructure.adapters.local_source import LocalFolderSource
+from ..infrastructure.config import settings as config
 from ..infrastructure.utils.audio_hash_registry import registry as hash_registry
-from ..infrastructure.utils.pipeline_tracker import PipelineTracker
+from ..infrastructure.utils.environment_validator import is_valid_audio
 from ..infrastructure.utils.logger import get_logger
+from ..infrastructure.utils.pipeline_tracker import PipelineTracker
 
 logger = get_logger("ingestion_engine")
 
+
 class IngestionEngine:
-    """
-    Orchestrates the discovery and registration of audio files.
-    """
-    
     def __init__(self, source: Optional[AudioSource] = None):
-        """
-        Initializes the engine with a specific source.
-        If no source is provided, it uses the default from settings.
-        """
         self.tracker = PipelineTracker()
         self.source = source or self._get_default_source()
         logger.info(f"Ingestion Engine initialized with source: {self.source.get_source_identifier()}")
 
     def _get_default_source(self) -> AudioSource:
-        """Factory method to create the default source based on config."""
         source_type = config.ACTIVE_AUDIO_SOURCE.lower()
         if source_type == "local":
             return LocalFolderSource()
-        # Add future sources here (e.g., S3, API)
-        else:
-            logger.error(f"Unsupported source type: {source_type}. Falling back to local.")
-            return LocalFolderSource()
+        logger.error(f"Unsupported source type '{source_type}'. Falling back to local.")
+        return LocalFolderSource()
 
     def ingest_new_files(self) -> List[AudioFileMetadata]:
-        """
-        Scans the source, filters duplicates, and registers new files in the tracker.
-        
-        Returns:
-            List of metadata for newly registered files.
-        """
-        all_files = self.source.list_files()
-        newly_registered = []
+        discovered_files = self.source.list_files()
+        newly_registered: List[AudioFileMetadata] = []
 
-        for file_meta in all_files:
-            file_id = file_meta.filename # Using filename as ID for now, can be hash-based
-            
-            # 1. Deduplication Check (File Content Hash)
-            is_duplicate = hash_registry.check_and_register(file_meta.file_path)
-            
-            if is_duplicate:
-                logger.debug(f"Skipping duplicate file: {file_meta.filename}")
+        for file_meta in discovered_files:
+            if not is_valid_audio(file_meta.file_path):
+                logger.warning(f"Skipping invalid audio file during ingestion: {file_meta.filename}")
                 continue
-                
-            # 2. Register in Pipeline Tracker
-            self.tracker.init_file(file_id)
-            self.tracker.update_stage_status(file_id, "ingestion", "completed")
-            
-            logger.info(f"Successfully ingested: {file_meta.filename}")
+
+            file_hash = hash_registry.compute_file_hash(file_meta.file_path)
+            file_id = f"{file_meta.file_path.stem}_{file_hash[:12]}"
+            registration = hash_registry.prepare_processing(file_hash, file_meta.file_path, file_id)
+            if not registration.should_process:
+                logger.info(f"Skipping duplicate completed file: {file_meta.filename}")
+                continue
+
+            file_meta.additional_meta["file_hash"] = file_hash
+            file_meta.additional_meta["file_id"] = file_id
+            self.tracker.init_file(
+                file_id,
+                file_hash=file_hash,
+                source_path=str(file_meta.file_path),
+                source=self.source.get_source_identifier(),
+                input_filename=file_meta.filename,
+            )
+            logger.info(f"Queued file for processing: {file_meta.filename}")
             newly_registered.append(file_meta)
-            
+
         return newly_registered
 
-    def run_full_pipeline_on_new(self):
-        """
-        Scans for new files and executes the full transcription pipeline for each.
-        """
-        from .transcription_runner import run_transcription
-        
+    def run_full_pipeline_on_new(self) -> None:
+        from .transcription_runner import TranscriptionRunner
+
         new_files = self.ingest_new_files()
         if not new_files:
             logger.info("No new files found to process.")
             return
-            
-        logger.info(f"Triggering pipeline for {len(new_files)} new files...")
-        
+
+        runner = TranscriptionRunner()
+        logger.info(f"Triggering pipeline for {len(new_files)} new files.")
         for file_meta in new_files:
             try:
-                run_transcription(file_meta.file_path)
-            except Exception as e:
-                logger.error(f"Failed to process {file_meta.filename}: {e}")
+                runner.run_pipeline(
+                    file_meta.file_path,
+                    source=self.source.get_source_identifier(),
+                )
+            except Exception as exc:
+                logger.error(f"Failed to process {file_meta.filename}: {exc}")
 
-# Global instance for easy use as a singleton entry point
+
 engine = IngestionEngine()
 
+
 def get_ingestion_endpoint() -> IngestionEngine:
-    """Returns the primary ingestion engine instance."""
     return engine

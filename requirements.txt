@@ -11,3 +11,8 @@ julius
 fastapi
 uvicorn
 python-dotenv
+portalocker
+numpy
+soundfile
+pedalboard
+python-multipart

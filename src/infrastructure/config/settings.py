@@ -1,17 +1,33 @@
 """
-Brickfolio Pipeline Configuration Engine
-
-This module centralizes all configurable parameters for the audio intelligence pipeline.
-It handles path resolution, API credentials, model selection, and the complex
-prompt engineering required for real estate call analysis.
+Central configuration for the Brickfolio transcription pipeline.
 """
+
+from __future__ import annotations
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Load environment variables from .env file for security and local development
 load_dotenv()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return int(value) if value is not None else default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return float(value) if value is not None else default
+
 
 # ==========================================
 # 0. DATABASE CONFIGURATION
@@ -19,141 +35,124 @@ load_dotenv()
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", None)
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "brickfolio_intelligence")
 
 # ==========================================
-# 1. PATH RESOLUTION & DIRECTORY STRUCTURE
+# 1. PATHS & DIRECTORIES
 # ==========================================
-# BASE_DIR is the root of the project
-BASE_DIR = Path(os.getenv("PIPELINE_BASE_DIR", Path(__file__).resolve().parent.parent.parent.parent))
+BASE_DIR = Path(os.getenv("PIPELINE_BASE_DIR", Path(__file__).resolve().parents[3]))
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
+TEMP_PROCESSING_DIR = BASE_DIR / "temp_processing"
 
-# Standard Data Flow Directories
-RAW_AUDIO_DIR = BASE_DIR / "Audio_Data"           # Where incoming raw calls land
-STANDARDIZED_AUDIO_DIR = DATA_DIR / "standardized" # Audio converted to WAV/16k/Mono
-CHUNKS_DIR = DATA_DIR / "chunks"                   # Temporary storage for long-call segments
-CLEANED_DIR = DATA_DIR / "cleaned"                 # Audio after AI restoration/denoising
-TRANSCRIPTS_DIR = DATA_DIR / "transcripts"         # Raw transcription outputs
-FINAL_DIR = DATA_DIR / "final"                     # Aggregated final artifacts
-RESULTS_DIR = DATA_DIR / "results"                 # Processed business intelligence (JSON/TXT)
+RAW_AUDIO_DIR = BASE_DIR / "Audio_Data"
+STANDARDIZED_AUDIO_DIR = DATA_DIR / "standardized"
+CHUNKS_DIR = DATA_DIR / "chunks"
+CLEANED_DIR = DATA_DIR / "cleaned"
+TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
+FINAL_DIR = DATA_DIR / "final"
+RESULTS_DIR = DATA_DIR / "results"
+OUTPUT_TRANSCRIPTS_DIR = OUTPUT_DIR / "transcripts"
+OUTPUT_SUMMARIES_DIR = OUTPUT_DIR / "summaries"
 
-# System & Metadata Directories
 LOGS_DIR = BASE_DIR / "logs"
 METADATA_DIR = BASE_DIR / "metadata"
+BILLING_DIR = METADATA_DIR / "billing"
+PIPELINE_STATE_FILE = METADATA_DIR / "pipeline_state.json"
+HASH_REGISTRY_FILE = METADATA_DIR / "audio_hash_registry.json"
+AUDIO_QUALITY_AUDIT_FILE = METADATA_DIR / "audio_quality_audit.json"
+AI_VALIDATION_LOG_FILE = LOGS_DIR / "ai_validation.jsonl"
+PERFORMANCE_REPORT_FILE = LOGS_DIR / "performance_report.csv"
 
 # ==========================================
-# 1.1 INGESTION & SOURCE CONFIGURATION
+# 2. SOURCE CONFIGURATION
 # ==========================================
-# Options: "local", "s3" (future), "api" (future)
 ACTIVE_AUDIO_SOURCE = os.getenv("ACTIVE_AUDIO_SOURCE", "local")
-LOCAL_SOURCE_PATH = RAW_AUDIO_DIR 
+LOCAL_SOURCE_PATH = RAW_AUDIO_DIR
 
 # ==========================================
-# 2. AUDIO PROCESSING SPECIFICATIONS
+# 3. AUDIO VALIDATION & STANDARDIZATION
 # ==========================================
-# Standardization targets for the transcription engine (Google/Sarvam/AI)
-TARGET_SAMPLE_RATE = 16000
-TARGET_CHANNELS = 1 # mono
-TARGET_FORMAT = "wav"
+SUPPORTED_AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
+MIN_AUDIO_BYTES = _env_int("MIN_AUDIO_BYTES", 1024)
+MIN_AUDIO_DURATION_SEC = _env_float("MIN_AUDIO_DURATION_SEC", 0.5)
 
-# Preprocessing / AI Denoiser Settings
-ENABLE_HPF = True      # High-Pass Filter (removes low hum/thumps)
-HPF_CUTOFF = 100       # Hz
-ENABLE_LPF = True      # Low-Pass Filter (removes high-frequency static)
-LPF_CUTOFF = 7500      # Hz
-GATE_THRESHOLD = -45.0 # dB (removes background silence noise)
-ENABLE_NORMALIZATION = True
-ENABLE_SPEECH_RESTORATION = True  # Activates the AI enhancement core
-ENABLE_ADAPTIVE_CLEANING = True    # Tunes cleaning based on SNR analysis
+TARGET_SAMPLE_RATE = _env_int("TARGET_SAMPLE_RATE", 16000)
+TARGET_CHANNELS = _env_int("TARGET_CHANNELS", 1)
+TARGET_FORMAT = os.getenv("TARGET_FORMAT", "wav")
 
-# Deepgram Settings
-# DEEPGRAM_API_KEY removed as it is not used in the current pipeline version
-# Default GEMINI_API_KEY to Trans Key if not explicitly set
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", os.getenv("GEMINI_TRANS_API_KEY"))
+# ==========================================
+# 4. PREPROCESSING / RESTORATION
+# ==========================================
+ENABLE_SPEECH_RESTORATION = _env_bool("ENABLE_SPEECH_RESTORATION", True)
+ENABLE_ADAPTIVE_CLEANING = _env_bool("ENABLE_ADAPTIVE_CLEANING", True)
+ENABLE_HPF = _env_bool("ENABLE_HPF", True)
+HPF_CUTOFF = _env_float("HPF_CUTOFF", 100.0)
+ENABLE_LPF = _env_bool("ENABLE_LPF", True)
+LPF_CUTOFF = _env_float("LPF_CUTOFF", 7500.0)
+GATE_THRESHOLD = _env_float("GATE_THRESHOLD", -45.0)
+ENABLE_NORMALIZATION = _env_bool("ENABLE_NORMALIZATION", True)
 
-# Separate Keys for Cost Tracking (Transcription vs Summarization)
+SNR_BYPASS_THRESHOLD = _env_float("SNR_BYPASS_THRESHOLD", 20.0)
+SNR_SAFE_THRESHOLD = _env_float("SNR_SAFE_THRESHOLD", 10.0)
+MAX_CLIPPING_RATE = _env_float("MAX_CLIPPING_RATE", 0.05)
+SPEECH_DROP_THRESHOLD_DB = _env_float("SPEECH_DROP_THRESHOLD_DB", -12.0)
+CLARITY_DROP_THRESHOLD_DB = _env_float("CLARITY_DROP_THRESHOLD_DB", 4.5)
+
+SAFE_NOISE_REDUCTION = _env_float("SAFE_NOISE_REDUCTION", 0.25)
+SAFE_COMPRESSOR_RATIO = _env_float("SAFE_COMPRESSOR_RATIO", 1.8)
+SAFE_GAIN_DB = _env_float("SAFE_GAIN_DB", 2.0)
+STRONG_COMPRESSOR_RATIO = _env_float("STRONG_COMPRESSOR_RATIO", 2.5)
+STRONG_GAIN_DB = _env_float("STRONG_GAIN_DB", 3.0)
+
+# ==========================================
+# 5. CHUNKING
+# ==========================================
+CHUNK_LENGTH_SEC = _env_int("CHUNK_LENGTH_SEC", 180)
+CHUNK_LENGTH_MS = CHUNK_LENGTH_SEC * 1000
+OVERLAP_SEC = _env_int("OVERLAP_SEC", 5)
+OVERLAP_MS = OVERLAP_SEC * 1000
+SEGMENT_THRESHOLD_SEC = _env_int("SEGMENT_THRESHOLD_SEC", 300)
+
+# ==========================================
+# 6. PROVIDERS / MODELS
+# ==========================================
 GEMINI_TRANS_API_KEY = os.getenv("GEMINI_TRANS_API_KEY")
 GEMINI_SUMM_API_KEY = os.getenv("GEMINI_SUMM_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", GEMINI_TRANS_API_KEY)
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Models & Providers
-DEEPGRAM_MODEL = "nova-2"
-GEMINI_MODEL = "gemini-2.5-pro"
+PRIMARY_TRANSCRIPTION_PROVIDER = os.getenv("PRIMARY_TRANSCRIPTION_PROVIDER", "gemini").lower()
+FALLBACK_TRANSCRIPTION_PROVIDER = os.getenv("FALLBACK_TRANSCRIPTION_PROVIDER", "deepgram").lower()
+ENABLE_PROVIDER_FALLBACK = _env_bool("ENABLE_PROVIDER_FALLBACK", True)
 
-# Requested Configuration: Optimized for Quota & Cost
-AUDIT_TRANSCRIPTION_MODEL = "gemini-2.5-flash"  # Flash for high-volume transcription
-AUDIT_INTELLIGENCE_MODEL = "gemini-2.5-pro"     # Pro for deep-dive intelligence
-SUMMARY_REFRESH_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+AUDIT_TRANSCRIPTION_MODEL = os.getenv("AUDIT_TRANSCRIPTION_MODEL", "gemini-2.5-flash")
+AUDIT_INTELLIGENCE_MODEL = os.getenv("AUDIT_INTELLIGENCE_MODEL", "gemini-2.5-pro")
+SUMMARY_REFRESH_MODEL = os.getenv("SUMMARY_REFRESH_MODEL", "gemini-2.5-pro")
+DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-2")
+DEEPGRAM_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "multi")
+DEEPGRAM_DIARIZE = _env_bool("DEEPGRAM_DIARIZE", True)
 
 PROVIDER_MODEL_LABELS = {
-  "gemini": "GEMINI_2.5-pro",
+    "gemini": AUDIT_TRANSCRIPTION_MODEL,
+    "deepgram": DEEPGRAM_MODEL,
 }
 
-DEEPGRAM_LANGUAGE = "multi"  # Enable multilingual (Hindi/Marathi/English)
-DEEPGRAM_DIARIZE = True   # Enable speaker identification
-
-# Preprocessing Settings
-ENABLE_HPF = True      # Enable High-Pass Filter to remove low-end noise
-HPF_CUTOFF = 100       # Lowering to 100Hz for Hindi speech safety
-ENABLE_LPF = True      # Enable Low-Pass Filter (requested for interference reduction)
-LPF_CUTOFF = 7500      # 7.5kHz cutoff for natural speech
-ENABLE_NORMALIZATION = True
-ENABLE_SPEECH_RESTORATION = True  # Unified name for the bouncer logic
-ENABLE_ADAPTIVE_CLEANING = True
-
-# Adaptive Pre-processing Thresholds
-SNR_BYPASS_THRESHOLD = 20.0  # dB
-SNR_SAFE_THRESHOLD = 10.0    # dB
-MAX_CLIPPING_RATE = 0.05
-SPEECH_DROP_THRESHOLD_DB = -12.0 # Max allowed dB drop before triggering fallback
-CLARITY_DROP_THRESHOLD_DB = 4.5  # Max allowed HF band loss before fallback
-
-# Adaptive profile tuning
-SAFE_NOISE_REDUCTION = 0.25
-SAFE_COMPRESSOR_RATIO = 1.8
-SAFE_GAIN_DB = 2.0
-STRONG_COMPRESSOR_RATIO = 2.5
-STRONG_GAIN_DB = 3.0
-
 # ==========================================
-# 3. CHUNKING & SEGMENTATION (Large Calls)
+# 7. PIPELINE CONTROL
 # ==========================================
-# Strategy: Long calls are broken into segments to avoid LLM context limits
-# and to allow parallel processing.
-CHUNK_LENGTH_MS = 180 * 1000  # 3 Minutes
-OVERLAP_MS = 5 * 1000        # 5 seconds overlap for context continuity
-SEGMENT_THRESHOLD_SEC = 300  # Files > 5 mins automatically trigger chunking
-
-# ==========================================
-# 4. API & MODEL CONFIGURATIONS
-# ==========================================
-# DEEPGRAM_API_KEY removed as it is not used in the current pipeline version
-
-# Primary Gemini API Key fallbacks
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", os.getenv("GEMINI_TRANS_API_KEY"))
-
-# Separate keys allow fine-grained quota management for different stages
-GEMINI_TRANS_API_KEY = os.getenv("GEMINI_TRANS_API_KEY", GEMINI_API_KEY)
-GEMINI_SUMM_API_KEY = os.getenv("GEMINI_SUMM_API_KEY", GEMINI_API_KEY)
-
-# Model Selection
-GEMINI_MODEL = "gemini-2.5-pro"
-AUDIT_TRANSCRIPTION_MODEL = "gemini-2.5-flash"
-AUDIT_INTELLIGENCE_MODEL = "gemini-2.5-pro"
-LEAD_BOUNCER_MODEL = "gemini-2.5-flash"
-
-# ==========================================
-# 5. PIPELINE BEHAVIOR & CONTROL
-# ==========================================
-ENABLED_PROVIDERS = ["gemini"]
-STRICT_MODEL_LOCK = True
-MAX_PARALLEL_WORKERS = 8      # Increased for high-speed batch processing
-GENERIC_TIMEOUT_SEC = 300     # Global API timeout
+STRICT_MODEL_LOCK = _env_bool("STRICT_MODEL_LOCK", True)
+MAX_CONCURRENT_CHUNKS = _env_int("MAX_CONCURRENT_CHUNKS", 4)
+MAX_PARALLEL_WORKERS = MAX_CONCURRENT_CHUNKS
+MAX_TRANSCRIPTION_VALIDATION_RETRIES = _env_int("MAX_TRANSCRIPTION_VALIDATION_RETRIES", 2)
+GENERIC_TIMEOUT_SEC = _env_int("GENERIC_TIMEOUT_SEC", 300)
+TRANSIENT_MAX_RETRIES = _env_int("TRANSIENT_MAX_RETRIES", 10)
+ENABLE_PIPELINE_RESUME = _env_bool("ENABLE_PIPELINE_RESUME", True)
 
 STRUCTURED_TRANSCRIPTION_PROMPT = """
-You are a high-fidelity audio transcription engine. 
+You are a high-fidelity audio transcription engine.
 Your goal is to generate a diarized transcript in strict JSON format, similar to subtitles.
 
 Return strict JSON with this schema:
@@ -161,8 +160,8 @@ Return strict JSON with this schema:
   "turns": [
     {
       "speaker": "Speaker Name/ID",
-      "start": number, (seconds)
-      "end": number, (seconds)
+      "start": number,
+      "end": number,
       "text": "The exact spoken text"
     }
   ]
